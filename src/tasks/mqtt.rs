@@ -46,15 +46,16 @@ pub async fn mqtt_task(stack: Stack<'static>) -> ! {
 
         let (user_name, password) = (env!("MQTT_USER"), env!("MQTT_PASSWORD").as_bytes());
 
-        let rx = &mut [0u8; 256];
-        let tx = &mut [0u8; 768];
+        const MQTT_BUFFER_SIZE: usize = 1024;
+        let rx = &mut [0u8; MQTT_BUFFER_SIZE];
+        let tx = &mut [0u8; MQTT_BUFFER_SIZE];
         let mut session = Session::new(
             ConfigBuilder::new(Buffers::new(rx, tx))
                         .client_id("esp32c3-co2")
                         .unwrap()
                         .auth(user_name, password)
                         .unwrap()
-                        .keepalive_interval(5)
+                        .keepalive_interval(30)
         );
 
         let mut connection = match session.connect(ws_conn).await {

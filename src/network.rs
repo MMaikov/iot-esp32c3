@@ -82,7 +82,7 @@ impl<'a> WsConfig<'a> {
             host,
             path: "/",
             tcp_timeout: Some(Duration::from_secs(60)),
-            keep_alive: Some(Duration::from_secs(30)),
+            keep_alive: Some(Duration::from_secs(15)),
             alpn: &[b"http/1.1"],
             port: 443
         }

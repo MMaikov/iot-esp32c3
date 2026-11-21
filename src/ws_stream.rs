@@ -6,6 +6,7 @@ use esp_hal::rng::Trng;
 pub enum WsError<E> {
     Io(E),
     UnexpectedEof,
+    ProtocolError
 }
 
 impl<E> From<E> for WsError<E> {
@@ -19,6 +20,7 @@ impl<E: IoError> IoError for WsError<E> {
         match self {
             WsError::Io(e) => e.kind(),
             WsError::UnexpectedEof => ErrorKind::BrokenPipe,
+            WsError::ProtocolError => ErrorKind::InvalidData
         }
     }
 }
@@ -37,6 +39,7 @@ impl<E: core::fmt::Display> core::fmt::Display for WsError<E> {
         match self {
             WsError::Io(e) => write!(f, "IO error: {}", e),
             WsError::UnexpectedEof => write!(f, "Unexpected EOF"),
+            WsError::ProtocolError => write!(f, "Protocol Error"),
         }
     }
 }
@@ -47,13 +50,14 @@ enum ReadState {
     Header { buf: [u8; 2], pos: usize },
     ExtLen { buf: [u8; 8], len: usize, pos: usize, opcode: u8, masked: bool },
     Mask { buf: [u8; 4], pos: usize, opcode: u8, payload_len: usize },
-    ControlPayload { buf: [u8; 125], len: usize, pos: usize, opcode: u8 },
-    DataPayload { remaining: usize },
+    ControlPayload { buf: [u8; 125], len: usize, pos: usize, opcode: u8, mask: Option<[u8; 4]> },
+    DataPayload { remaining: usize, offset: usize, mask: Option<[u8; 4]> },
 }
 
 pub struct WsStream<S> {
     inner: S,
     state: ReadState,
+    rng: Trng
 }
 
 impl<S> WsStream<S> {
@@ -61,6 +65,7 @@ impl<S> WsStream<S> {
         Self {
             inner,
             state: ReadState::Header { buf: [0; 2], pos: 0 },
+            rng:  Trng::try_new().expect("Trng failure")
         }
     }
 }
@@ -98,7 +103,7 @@ impl<S: Read + Write> Read for WsStream<S> {
                             if masked {
                                 ReadState::Mask { buf: [0; 4], pos: 0, opcode, payload_len }
                             } else {
-                                Self::next_payload_state(opcode, payload_len)
+                                Self::next_payload_state(opcode, payload_len, None)?
                             }
                         }
                     }
@@ -122,7 +127,7 @@ impl<S: Read + Write> Read for WsStream<S> {
                     self.state = if is_masked {
                         ReadState::Mask { buf: [0; 4], pos: 0, opcode: op, payload_len }
                     } else {
-                        Self::next_payload_state(op, payload_len)
+                        Self::next_payload_state(op, payload_len, None)?
                     }
                 },
                 ReadState::Mask { buf: mask, pos, opcode, payload_len } => {
@@ -133,9 +138,9 @@ impl<S: Read + Write> Read for WsStream<S> {
                         }
                         *pos += n;
                     }
-                    self.state = Self::next_payload_state(*opcode, *payload_len);
+                    self.state = Self::next_payload_state(*opcode, *payload_len, Some(*mask))?;
                 },
-                ReadState::ControlPayload { buf: ctrl, len, pos, opcode } => {
+                ReadState::ControlPayload { buf: ctrl, len, pos, opcode, mask} => {
                     while *pos < *len {
                         let n = self.inner.read(&mut ctrl[*pos..*len]).await?;
                         if n == 0 {
@@ -143,13 +148,24 @@ impl<S: Read + Write> Read for WsStream<S> {
                         }
                         *pos += n;
                     }
-                    let (op, payload_len) = (*opcode, *len);
+                    let (op, payload_len, frame_mask) = (*opcode, *len, *mask);
+
+                    if let Some(m) = frame_mask {
+                        for i in 0..payload_len {
+                            ctrl[i] ^= m[i & 3];
+                        }
+                    }
+
                     if op == 0x08 {
+                        let out_mask = self.rng.random().to_ne_bytes();
+                        let close_hdr = [0x88, 0x80, out_mask[0], out_mask[1], out_mask[2], out_mask[3]];
+                        let _ = self.inner.write_all(&close_hdr).await;
+                        let _ = self.inner.flush().await;
                         self.state = ReadState::Header { buf: [0; 2], pos: 0 };
                         return Ok(0);
                     }
                     if op == 0x09 {
-                        let mask = Trng::try_new().expect("Trng failed").random().to_ne_bytes();
+                        let mask = self.rng.random().to_ne_bytes();
                         let pong_hdr = [0x8A, 0x80 | (payload_len as u8), mask[0], mask[1], mask[2], mask[3]];
                         for i in 0..payload_len {
                             ctrl[i] ^= mask[i & 3];
@@ -160,7 +176,7 @@ impl<S: Read + Write> Read for WsStream<S> {
                     }
                     self.state = ReadState::Header { buf: [0; 2], pos: 0 };
                 },
-                ReadState::DataPayload { remaining } => {
+                ReadState::DataPayload { remaining, offset, mask } => {
                     if *remaining == 0 {
                         self.state = ReadState::Header { buf: [0; 2], pos: 0 };
                         continue;
@@ -170,6 +186,14 @@ impl<S: Read + Write> Read for WsStream<S> {
                     if n == 0 {
                         return Err(WsError::UnexpectedEof);
                     }
+
+                    if let Some(m) = *mask {
+                        for i in 0..n {
+                            buf[i] ^= m[(*offset + i) & 3];
+                        }
+                    }
+
+                    *offset += n;
                     *remaining -= n;
                     if *remaining == 0 {
                         self.state = ReadState::Header { buf: [0; 2], pos: 0 };
@@ -182,21 +206,29 @@ impl<S: Read + Write> Read for WsStream<S> {
 }
 
 impl<S> WsStream<S> {
-    fn next_payload_state(opcode: u8, payload_len: usize) -> ReadState {
+    fn next_payload_state<E>(opcode: u8, payload_len: usize, mask: Option<[u8; 4]>) -> Result<ReadState, WsError<E>> {
         match opcode {
             0x00 | 0x01 | 0x02 => {
                 if payload_len == 0 {
-                    ReadState::Header { buf: [0; 2], pos: 0 }
+                    Ok(ReadState::Header { buf: [0; 2], pos: 0 })
                 } else {
-                    ReadState::DataPayload { remaining: payload_len }
+                    Ok(ReadState::DataPayload { remaining: payload_len, offset: 0, mask })
                 }
             },
-            _ => ReadState::ControlPayload { 
-                buf: [0; 125], 
-                len: payload_len.min(125), 
-                pos: 0, 
-                opcode 
+            0x08 | 0x09 | 0x0A => {
+                if payload_len > 125 {
+                    return Err(WsError::ProtocolError);
+                }
+                
+                Ok(ReadState::ControlPayload { 
+                    buf: [0; 125], 
+                    len: payload_len, 
+                    pos: 0, 
+                    opcode,
+                    mask
+                })
             },
+            _ => Err(WsError::ProtocolError),
         }
     }
 }
@@ -207,7 +239,7 @@ impl<S: Write> Write for WsStream<S> {
             return Ok(0);
         }
 
-        let mask = Trng::try_new().expect("Trng failed").random().to_ne_bytes();
+        let mask = self.rng.random().to_ne_bytes();
         let len = buf.len();
 
         if len <= 125 {
